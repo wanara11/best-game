@@ -398,3 +398,403 @@ function attributesOf(body: string): Map<string, string> {
   while (i < body.length) {
     while (i < body.length && /[\s/]/.test(body[i]!)) i++;
     if (i >= body.length) break;
+    const start = i;
+    while (i < body.length && !/[\s=/>]/.test(body[i]!)) i++;
+    const name = body.slice(start, i).toLowerCase();
+    while (i < body.length && /\s/.test(body[i]!)) i++;
+    let value = '';
+    if (body[i] === '=') {
+      i++;
+      while (i < body.length && /\s/.test(body[i]!)) i++;
+      const quote = body[i];
+      if (quote === '"' || quote === "'") {
+        const end = body.indexOf(quote, i + 1);
+        value = body.slice(i + 1, end < 0 ? body.length : end);
+        i = end < 0 ? body.length : end + 1;
+      } else {
+        // An unquoted value runs to whitespace or the tag's >; a / inside it is part of the value.
+        const s = i;
+        while (i < body.length && !/[\s>]/.test(body[i]!)) i++;
+        value = body.slice(s, i);
+      }
+    }
+    if (name !== '') out.set(name, value);
+  }
+  return out;
+}
+
+/** The index of `</name` at or after `from`, ASCII case-insensitively; -1 when there is none. */
+function closeIndexOf(html: string, from: number, name: string): number {
+  const needle = `</${name}`;
+  for (let i = from; i + needle.length <= html.length; i++) {
+    if (html[i] !== '<') continue;
+    let hit = true;
+    for (let j = 1; j < needle.length; j++) {
+      const a = html[i + j]!.toLowerCase();
+      if (a !== needle[j]) {
+        hit = false;
+        break;
+      }
+    }
+    if (hit) return i;
+  }
+  return -1;
+}
+
+/**
+ * Every <script>, <link href>, <img src>, <source src>, <video src>, <audio src>, <iframe src> and
+ * <script type="importmap"> of a page, in document order. Comments and the document type are skipped. This is a tag
+ * scan, not an HTML parser: it reads the attributes these tags carry and nothing else.
+ */
+export function htmlFacts(html: string): HtmlFacts {
+  const scripts: HtmlScript[] = [];
+  const links: HtmlLink[] = [];
+  const resources: HtmlResource[] = [];
+  const importMaps: HtmlImportMap[] = [];
+  let i = 0;
+  while (i < html.length) {
+    const at = html.indexOf('<', i);
+    if (at < 0) break;
+    if (html.startsWith('<!--', at)) {
+      const end = html.indexOf('-->', at + 4);
+      i = end < 0 ? html.length : end + 3;
+      continue;
+    }
+    if (html.startsWith('<!', at)) {
+      const end = html.indexOf('>', at + 2);
+      i = end < 0 ? html.length : end + 1;
+      continue;
+    }
+    const rest = html.slice(at + 1, at + 8).toLowerCase();
+    if (rest.startsWith('script') && !/[A-Za-z0-9]/.test(html[at + 7] ?? '')) {
+      const end = tagEnd(html, at + 7);
+      if (end < 0) break;
+      const attrs = attributesOf(html.slice(at + 7, end));
+      const type = (attrs.get('type') ?? '').trim().toLowerCase();
+      const src = attrs.get('src') ?? null;
+      let body = '';
+      if (src === null) {
+        const close = closeIndexOf(html, end + 1, 'script');
+        body = html.slice(end + 1, close < 0 ? html.length : close);
+        i = close < 0 ? html.length : close + 8;
+      } else {
+        const close = closeIndexOf(html, end + 1, 'script');
+        i = close < 0 ? html.length : close + 8;
+      }
+      if (type === 'importmap') {
+        let value: unknown = null;
+        let error: string | null = null;
+        try {
+          value = JSON.parse(body);
+        } catch (err) {
+          error = (err as Error).message;
+        }
+        importMaps.push({ value, error });
+      } else {
+        scripts.push({ src, type, text: src === null ? body : '' });
+      }
+      continue;
+    }
+    if (rest.startsWith('link') && !/[A-Za-z0-9]/.test(html[at + 5] ?? '')) {
+      const end = tagEnd(html, at + 5);
+      if (end < 0) break;
+      const attrs = attributesOf(html.slice(at + 5, end));
+      const href = attrs.get('href');
+      if (href !== undefined) links.push({ href, rel: (attrs.get('rel') ?? '').trim().toLowerCase() });
+      i = end + 1;
+      continue;
+    }
+    const tag = RESOURCE_TAGS.find((name) => rest.startsWith(name) && !/[A-Za-z0-9]/.test(html[at + 1 + name.length] ?? ''));
+    if (tag !== undefined) {
+      const end = tagEnd(html, at + 1 + tag.length);
+      if (end < 0) break;
+      const attrs = attributesOf(html.slice(at + 1 + tag.length, end));
+      const src = attrs.get('src');
+      if (src !== undefined) resources.push({ tag, src });
+      i = end + 1;
+      continue;
+    }
+    const end = tagEnd(html, at + 1);
+    i = end < 0 ? html.length : end + 1;
+  }
+  return { scripts, links, resources, importMaps };
+}
+
+/** A page's import map: its imports and scopes, each a specifier to a reference; a null value blocks its specifier. */
+export interface ImportMap {
+  imports: Record<string, string | null>;
+  scopes: Record<string, Record<string, string | null>>;
+}
+
+/**
+ * A page's one import map, or none: `map` and `error` both null when the page holds no import map (it is optional),
+ * `map` null and `error` saying why when the page holds one that cannot be used.
+ */
+export interface ImportMapRead {
+  map: ImportMap | null;
+  error: string | null;
+}
+
+/** Whether `value` is a plain object. */
+const isObject = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
+
+/** An own enumerable property set whatever its key: a "__proto__" key stays a key, never the prototype. */
+function setOwn<T>(o: Record<string, T>, key: string, value: T): void {
+  Object.defineProperty(o, key, { value, enumerable: true, writable: true, configurable: true });
+}
+
+/**
+ * The page's import map, parsed: none (map and error null) when the page holds no <script type="importmap">, else
+ * its one map, or why it cannot be used (a second map, text that is not JSON, or a shape an import map does not have).
+ * "imports" and "scopes" are each optional; a null value is kept: it blocks its specifier.
+ */
+export function importMapOf(facts: HtmlFacts): ImportMapRead {
+  if (facts.importMaps.length === 0) return { map: null, error: null };
+  if (facts.importMaps.length > 1) return { map: null, error: `index.html holds ${facts.importMaps.length} import maps: a page holds one at most` };
+  const only = facts.importMaps[0]!;
+  if (only.error !== null) return { map: null, error: `index.html's import map is not JSON (${only.error})` };
+  if (!isObject(only.value)) return { map: null, error: 'index.html\'s import map is not a JSON object' };
+  const importsRaw = only.value.imports ?? {};
+  if (!isObject(importsRaw)) return { map: null, error: 'index.html\'s import map holds an "imports" that is not an object' };
+  const imports: Record<string, string | null> = {};
+  for (const [key, value] of Object.entries(importsRaw)) {
+    if (value !== null && typeof value !== 'string') return { map: null, error: `index.html's import map maps ${JSON.stringify(key)} to no string` };
+    setOwn(imports, key, value);
+  }
+  const scopes: Record<string, Record<string, string | null>> = {};
+  const scopesRaw = only.value.scopes;
+  if (scopesRaw !== undefined) {
+    if (!isObject(scopesRaw)) return { map: null, error: 'index.html\'s import map holds a "scopes" that is not an object' };
+    for (const [scope, entries] of Object.entries(scopesRaw)) {
+      if (!isObject(entries)) return { map: null, error: `index.html's import map scope ${JSON.stringify(scope)} is not an object` };
+      const inner: Record<string, string | null> = {};
+      for (const [key, value] of Object.entries(entries)) {
+        if (value !== null && typeof value !== 'string') return { map: null, error: `index.html's import map scope ${JSON.stringify(scope)} maps ${JSON.stringify(key)} to no string` };
+        setOwn(inner, key, value);
+      }
+      setOwn(scopes, scope, inner);
+    }
+  }
+  return { map: { imports, scopes }, error: null };
+}
+
+/** A URI scheme's leading `name:`. */
+const URI_SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:/;
+
+/** Whether a reference is relative: not empty, no scheme, no leading // and no leading /. */
+export function isRelativeRef(ref: string): boolean {
+  return ref.length > 0 && !URI_SCHEME.test(ref) && !ref.startsWith('//') && !ref.startsWith('/');
+}
+
+/**
+ * Whether a module specifier is relative in JavaScript's sense: it starts with ./ or ../ (or is . or ..). A
+ * specifier like `phaser` or `main.js` is bare: a browser resolves it through the import map or fails, it never
+ * loads a file beside the importer. isRelativeRef answers for a URL reference (an attribute or an import-map value),
+ * where `main.js` is relative to the page.
+ */
+export function isRelativeSpecifier(specifier: string): boolean {
+  return specifier === '.' || specifier === '..' || specifier.startsWith('./') || specifier.startsWith('../');
+}
+
+/**
+ * The path under game/ that the relative reference `ref` names, resolved against the importing file's path
+ * (`from`, POSIX and relative to game/, like `src/main.js`; index.html is `index.html`). A query or fragment is
+ * dropped. Null when `ref` is not relative, names nothing, or climbs out of game/.
+ */
+export function resolveGamePath(ref: string, from: string): string | null {
+  if (!isRelativeRef(ref)) return null;
+  const cut = ref.search(/[?#]/);
+  const raw = cut < 0 ? ref : ref.slice(0, cut);
+  if (raw === '') return null;
+  const parts = from.split('/').slice(0, -1);
+  for (const seg of raw.split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') {
+      if (parts.length === 0) return null;
+      parts.pop();
+      continue;
+    }
+    parts.push(seg);
+  }
+  if (parts.length === 0) return null;
+  return parts.join('/');
+}
+
+/** What an import map says about a specifier: found false when it maps nothing, or value null when a null entry blocks it. */
+export interface ImportMapMatch {
+  found: boolean;
+  value: string | null;
+}
+
+/** The entry for a specifier in one map: an exact own key, else the longest own key ending in / that prefixes it. */
+function entryOf(entries: Record<string, string | null>, specifier: string): ImportMapMatch {
+  if (Object.hasOwn(entries, specifier)) return { found: true, value: entries[specifier]! };
+  let best: string | null = null;
+  for (const key of Object.keys(entries)) {
+    if (key.endsWith('/') && specifier.startsWith(key) && (best === null || key.length > best.length)) best = key;
+  }
+  if (best === null) return { found: false, value: null };
+  const base = entries[best]!;
+  if (base === null) return { found: true, value: null };
+  return { found: true, value: `${base}${specifier.slice(best.length)}` };
+}
+
+/**
+ * The game path a scope key's URL prefix names, or null when it cannot name one: a reference resolved against
+ * index.html, with '.' and './' being game/ itself. An absolute scope names a site path, not a file of the game.
+ */
+function scopePath(scope: string): string | null {
+  const cut = scope.search(/[?#]/);
+  const raw = cut < 0 ? scope : scope.slice(0, cut);
+  if (raw === '.' || raw === './') return '';
+  return resolveGamePath(scope, INDEX_HTML);
+}
+
+/**
+ * What the page's import map says for `specifier` imported from `from` (a path under game/, index.html for an inline
+ * script): a matching scope's map first, its longest URL prefix winning, then the top-level imports.
+ */
+export function importMapMatch(map: ImportMap | null, specifier: string, from: string = INDEX_HTML): ImportMapMatch {
+  if (map === null) return { found: false, value: null };
+  let best: { prefix: string; entries: Record<string, string | null> } | null = null;
+  for (const [scope, entries] of Object.entries(map.scopes)) {
+    const prefix = scopePath(scope);
+    if (prefix === null || !from.startsWith(prefix)) continue;
+    if (best === null || prefix.length > best.prefix.length) best = { prefix, entries };
+  }
+  if (best !== null) {
+    const scoped = entryOf(best.entries, specifier);
+    if (scoped.found) return scoped;
+  }
+  return entryOf(map.imports, specifier);
+}
+
+/**
+ * The value an import map gives a bare specifier imported from `from`: a matching scope's entry or the top-level
+ * one, an exact key first then the longest key ending in / that prefixes it; null when none maps it or a null entry
+ * blocks it.
+ */
+export function mappedSpecifier(map: ImportMap | null, specifier: string, from: string = INDEX_HTML): string | null {
+  const match = importMapMatch(map, specifier, from);
+  return match.found ? match.value : null;
+}
+
+/** The path a specifier names from `from`: relative to the importer, or through the import map; null when neither gives a path under game/. */
+function resolveSpecifier(specifier: string, from: string, map: ImportMap | null): string | null {
+  if (isRelativeSpecifier(specifier)) return resolveGamePath(specifier, from);
+  const match = importMapMatch(map, specifier, from);
+  if (!match.found || match.value === null || !isRelativeRef(match.value)) return null;
+  return resolveGamePath(match.value, INDEX_HTML);
+}
+
+// ---------------------------------------------------------------- static imports
+
+/** What a lexical scan of a module's text is doing, character by character. */
+const IDENT_START = /[A-Za-z_$]/;
+const IDENT = /[A-Za-z0-9_$]/;
+
+/**
+ * A module's static import and export-from specifiers, in source order, by a lexical scan: comments, strings,
+ * template literals and regular-expression literals are skipped, so the words inside them are never read as
+ * imports. This is not a parser; it recognizes `import 'x'`, `import ... from 'x'`, `export ... from 'x'` and
+ * `export * from 'x'`, and leaves anything else alone.
+ */
+export function sourceImports(source: string): string[] {
+  const out: string[] = [];
+  const n = source.length;
+  let i = 0;
+  /** The last significant (non-space, non-comment) character, for the regex-versus-division guess. */
+  const regexPosition = (prev: string): boolean => prev === '' || '([{,;:=!&|?+-*%^~<>'.includes(prev);
+  let prev = '';
+
+  const skipSpace = (): void => {
+    for (;;) {
+      while (i < n && /\s/.test(source[i]!)) i++;
+      if (source.startsWith('//', i)) {
+        while (i < n && source[i] !== '\n') i++;
+        continue;
+      }
+      if (source.startsWith('/*', i)) {
+        const end = source.indexOf('*/', i + 2);
+        i = end < 0 ? n : end + 2;
+        continue;
+      }
+      return;
+    }
+  };
+  const skipString = (quote: string): string | null => {
+    i++;
+    let s = '';
+    while (i < n) {
+      const ch = source[i]!;
+      if (ch === quote) {
+        i++;
+        return s;
+      }
+      if (ch === '\\') {
+        const next = source[i + 1];
+        if (next === undefined) return null;
+        s += next === 'n' ? '\n' : next === 't' ? '\t' : next === 'r' ? '\r' : next;
+        i += 2;
+        continue;
+      }
+      if (ch === '\n') return null;
+      s += ch;
+      i++;
+    }
+    return null;
+  };
+  const skipTemplate = (): void => {
+    i++;
+    while (i < n) {
+      const ch = source[i]!;
+      if (ch === '\\') {
+        i += 2;
+        continue;
+      }
+      if (ch === '`') {
+        i++;
+        return;
+      }
+      i++;
+    }
+  };
+  const skipRegex = (): void => {
+    i++;
+    let inClass = false;
+    while (i < n) {
+      const ch = source[i]!;
+      if (ch === '\\') {
+        i += 2;
+        continue;
+      }
+      if (ch === '[') inClass = true;
+      else if (ch === ']') inClass = false;
+      else if (ch === '/' && !inClass) {
+        i++;
+        return;
+      } else if (ch === '\n') return;
+      i++;
+    }
+  };
+  const readWord = (): string => {
+    const start = i;
+    while (i < n && IDENT.test(source[i]!)) i++;
+    return source.slice(start, i);
+  };
+  /** Reads a string literal at i, or null; advances past it either way. */
+  const maybeString = (): string | null => {
+    skipSpace();
+    const ch = source[i];
+    if (ch !== '"' && ch !== "'") return null;
+    return skipString(ch);
+  };
+  /** From just after `import`/`export`, reads a clause and its `from 'x'`; returns the specifier or null. */
+  const clause = (stopAt: string[]): string | null => {
+    for (;;) {
+      skipSpace();
+      if (i >= n) return null;
+      const ch = source[i]!;
+      if (stopAt.includes(ch)) return null;
+      if (ch === '"' || ch === "'") return skipString(ch);
+      if (ch === '{' || ch === '}') {
